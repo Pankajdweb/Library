@@ -6,6 +6,380 @@
  * - centered play button
  * - only one non-autoplay video plays at a time
  */
+
+
+/**
+ * Thumbnail helper for Universal Video Player
+ *
+ * Rules:
+ * - If `.vp-thumbnail` already has a usable `src`, do nothing.
+ * - Otherwise:
+ *   - YouTube: fetch best available thumbnail URL
+ *   - Vimeo: fetch thumbnail via oEmbed
+ *   - Native video: generate thumbnail from a non-black frame
+ * - Thumbnail visibility:
+ *   - Visible on page load
+ *   - Hidden while playing
+ *   - Shown again ONLY when playback ends
+ *   - If user pauses before the end, do NOT show thumbnail
+ */
+(function (window) {
+  "use strict";
+
+  if (!window || !window.document) return;
+
+  function isUsableUrl(url) {
+    if (!url) return false;
+    var s = String(url).trim();
+    if (!s) return false;
+    if (s === "#" || s.toLowerCase() === "null" || s.toLowerCase() === "undefined") return false;
+    return true;
+  }
+
+  function extractYouTubeId(url) {
+    if (!url) return null;
+    var m =
+      url.match(/(?:youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/embed\/)([^&\n?#]+)/) ||
+      url.match(/youtube\.com\/.*[?&]v=([^&\n?#]+)/);
+    return m ? m[1] : null;
+  }
+
+  function extractVimeoId(url) {
+    if (!url) return null;
+    var m = url.match(/vimeo\.com\/(\d+)/) || url.match(/vimeo\.com\/.*\/(\d+)/);
+    return m ? m[1] : null;
+  }
+
+  function detectSource(url) {
+    var yt = extractYouTubeId(url);
+    if (yt) return { type: "youtube", id: yt };
+    var vm = extractVimeoId(url);
+    if (vm) return { type: "vimeo", id: vm };
+    return { type: "native", id: url || "" };
+  }
+
+  function ensureThumbnailEls(wrapper) {
+    if (!wrapper) return null;
+    var container = wrapper.querySelector(".vp-container");
+    if (!container) return null;
+
+    var holder = container.querySelector(".vp-thumbnail-holder");
+    if (!holder) {
+      holder = document.createElement("div");
+      holder.className = "vp-thumbnail-holder";
+      container.appendChild(holder);
+    }
+
+    var img = holder.querySelector("img.vp-thumbnail");
+    if (!img) {
+      img = document.createElement("img");
+      img.className = "vp-thumbnail";
+      img.alt = "";
+      holder.appendChild(img);
+    }
+
+    return { container: container, holder: holder, img: img };
+  }
+
+  function loadImage(url) {
+    return new Promise(function (resolve, reject) {
+      var img = new Image();
+      img.decoding = "async";
+      img.loading = "eager";
+      img.onload = function () { resolve(img); };
+      img.onerror = function () { reject(new Error("Image failed to load")); };
+      img.src = url;
+    });
+  }
+
+  async function getYouTubeThumbnailUrl(videoId) {
+    // Prefer maxres, but if unavailable YouTube returns a tiny placeholder (often 120x90).
+    var candidates = [
+      "https://i.ytimg.com/vi/" + videoId + "/maxresdefault.jpg",
+      "https://i.ytimg.com/vi/" + videoId + "/sddefault.jpg",
+      "https://i.ytimg.com/vi/" + videoId + "/hqdefault.jpg",
+      "https://i.ytimg.com/vi/" + videoId + "/mqdefault.jpg",
+    ];
+
+    for (var i = 0; i < candidates.length; i++) {
+      try {
+        var img = await loadImage(candidates[i]);
+        if (img && img.naturalWidth && img.naturalHeight) {
+          if (img.naturalWidth > 200) return candidates[i];
+        }
+      } catch (e) {}
+    }
+    // Fallback anyway
+    return candidates[candidates.length - 1];
+  }
+
+  async function getVimeoThumbnailUrl(originalUrl) {
+    // oEmbed gives a ready-to-use thumbnail URL
+    var endpoint = "https://vimeo.com/api/oembed.json?url=" + encodeURIComponent(originalUrl);
+    var res = await fetch(endpoint, { method: "GET" });
+    if (!res.ok) throw new Error("Vimeo oEmbed failed: " + res.status);
+    var data = await res.json();
+    if (data && isUsableUrl(data.thumbnail_url)) return data.thumbnail_url;
+    throw new Error("Vimeo oEmbed missing thumbnail_url");
+  }
+
+  function isFrameMostlyBlack(ctx, w, h) {
+    // Sample a small image for speed.
+    var sampleW = Math.max(8, Math.min(64, w));
+    var sampleH = Math.max(8, Math.min(36, h));
+    var tmp = document.createElement("canvas");
+    tmp.width = sampleW;
+    tmp.height = sampleH;
+    var tctx = tmp.getContext("2d", { willReadFrequently: true });
+    if (!tctx) return true;
+    tctx.drawImage(ctx.canvas, 0, 0, w, h, 0, 0, sampleW, sampleH);
+    var img = tctx.getImageData(0, 0, sampleW, sampleH).data;
+
+    var total = 0;
+    var count = 0;
+    // step through pixels; include alpha
+    for (var i = 0; i < img.length; i += 16) {
+      var r = img[i], g = img[i + 1], b = img[i + 2], a = img[i + 3];
+      if (a < 16) continue;
+      // perceived luminance
+      var y = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+      total += y;
+      count++;
+    }
+    if (!count) return true;
+    var avg = total / count;
+    // threshold tuned to reject typical black intro frames
+    return avg < 18;
+  }
+  async function generateNativeThumbnail(videoUrl, wrapper) {
+    function attemptCapture(useCORS) {
+      return new Promise(function (resolve, reject) {
+        var v = document.createElement("video");
+        v.muted = true;
+        v.playsInline = true;
+        v.preload = "auto";
+        if (useCORS) v.crossOrigin = "anonymous";
+  
+        var cleaned = false;
+        function cleanup() {
+          if (cleaned) return;
+          cleaned = true;
+          try { v.pause(); } catch (e) {}
+          v.removeAttribute("src");
+          try { v.load(); } catch (e) {}
+        }
+  
+        var captureTimeout = null;
+  
+        function captureFrame() {
+          var w = v.videoWidth;
+          var h = v.videoHeight;
+          if (!w || !h) return false;
+  
+          var canvas = document.createElement("canvas");
+          canvas.width = w;
+          canvas.height = h;
+          var ctx = canvas.getContext("2d", { willReadFrequently: true });
+          if (!ctx) return false;
+  
+          ctx.drawImage(v, 0, 0, w, h);
+  
+          try {
+            ctx.getImageData(0, 0, 1, 1); // taint check
+          } catch (e) {
+            cleanup();
+            reject(e); // SecurityError — caller retries with CORS
+            return true; // signal "handled"
+          }
+  
+          if (isFrameMostlyBlack(ctx, w, h)) return false; // keep playing
+  
+          var dataUrl = canvas.toDataURL("image/jpeg", 0.82);
+          cleanup();
+          resolve(dataUrl);
+          return true;
+        }
+  
+        // Attempt capture on every timeupdate until we get a good frame
+        var attempts = 0;
+        function onTimeUpdate() {
+          attempts++;
+          if (captureFrame()) {
+            v.removeEventListener("timeupdate", onTimeUpdate);
+            return;
+          }
+          // Give up after ~60 updates (~2s of playback) to avoid running forever
+          if (attempts > 60) {
+            v.removeEventListener("timeupdate", onTimeUpdate);
+            // Last resort: capture whatever frame we have now, black or not
+            var w = v.videoWidth, h = v.videoHeight;
+            if (w && h) {
+              var canvas = document.createElement("canvas");
+              canvas.width = w; canvas.height = h;
+              var ctx = canvas.getContext("2d", { willReadFrequently: true });
+              ctx.drawImage(v, 0, 0, w, h);
+              try {
+                var dataUrl = canvas.toDataURL("image/jpeg", 0.82);
+                cleanup();
+                resolve(dataUrl);
+                return;
+              } catch (e) {}
+            }
+            cleanup();
+            reject(new Error("No usable frame found"));
+          }
+        }
+  
+        v.addEventListener("error", function () {
+          cleanup();
+          reject(new Error("Video load error: " + (v.error ? v.error.message : "unknown")));
+        }, { once: true });
+  
+        v.addEventListener("loadedmetadata", function () {
+          if (!v.videoWidth || !v.videoHeight) {
+            cleanup();
+            reject(new Error("Missing video dimensions"));
+            return;
+          }
+  
+          // Safety timeout: if canplay never fires within 10s, give up
+          captureTimeout = setTimeout(function () {
+            v.removeEventListener("timeupdate", onTimeUpdate);
+            cleanup();
+            reject(new Error("Playback timeout — video unresponsive"));
+          }, 10000);
+  
+          v.addEventListener("canplay", function () {
+            v.addEventListener("timeupdate", onTimeUpdate);
+            v.play().catch(function (e) {
+              clearTimeout(captureTimeout);
+              cleanup();
+              reject(new Error("play() failed: " + e.message));
+            });
+          }, { once: true });
+        }, { once: true });
+  
+        v.addEventListener("ended", function () {
+          // Video ended before we got a good frame — capture whatever is showing
+          clearTimeout(captureTimeout);
+          v.removeEventListener("timeupdate", onTimeUpdate);
+          captureFrame(); // one last try
+          if (!cleaned) {
+            cleanup();
+            reject(new Error("Video ended without a usable frame"));
+          }
+        }, { once: true });
+  
+        v.src = videoUrl;
+        v.load();
+      });
+    }
+  
+    // Try without CORS first; retry with CORS if canvas is tainted
+    try {
+      return await attemptCapture(false);
+    } catch (e1) {
+      var isTaint = e1 && (e1.name === "SecurityError" || /tainted|cross.?origin/i.test(e1.message));
+      if (!isTaint) throw e1;
+      return await attemptCapture(true);
+    }
+  }
+
+  async function ensureThumbnailUrl(wrapper) {
+    if (!wrapper || !wrapper.getAttribute) return;
+    var url = wrapper.getAttribute("data-video-url") || "";
+    if (!url) return;
+
+    var els = ensureThumbnailEls(wrapper);
+    if (!els || !els.img) return;
+
+    // If author provided a valid thumbnail already, keep it.
+    if (isUsableUrl(els.img.getAttribute("src"))) {
+      wrapper.dataset.vpThumbnailReady = "true";
+      return;
+    }
+
+    var src = detectSource(url);
+    try {
+      if (src.type === "youtube" && src.id) {
+        els.img.src = await getYouTubeThumbnailUrl(src.id);
+        wrapper.dataset.vpThumbnailReady = "true";
+        return;
+      }
+      if (src.type === "vimeo") {
+        els.img.src = await getVimeoThumbnailUrl(url);
+        wrapper.dataset.vpThumbnailReady = "true";
+        return;
+      }
+      if (src.type === "native" && isUsableUrl(src.id)) {
+        // Generate a thumbnail only if CORS allows it; otherwise fail silently.
+        els.img.src = await generateNativeThumbnail(src.id, wrapper);
+        wrapper.dataset.vpThumbnailReady = "true";
+        return;
+      }
+    } catch (e) {
+      // Silent by default; keep empty thumbnail rather than breaking playback.
+      wrapper.dataset.vpThumbnailReady = "false";
+    }
+  }
+
+  function hideThumbnail(wrapper) {
+    if (!wrapper) return;
+    wrapper.classList.add("vp-thumb-hidden");
+  }
+
+  function showThumbnail(wrapper) {
+    if (!wrapper) return;
+    wrapper.classList.remove("vp-thumb-hidden");
+  }
+
+  function initWrapper(wrapper) {
+    if (!wrapper || wrapper._vpThumbInitialized) return;
+    wrapper._vpThumbInitialized = true;
+
+    ensureThumbnailEls(wrapper);
+
+    // Visible on load, except autoplay (background hero).
+    if (wrapper.hasAttribute("data-autoplay")) hideThumbnail(wrapper);
+    else showThumbnail(wrapper);
+
+    ensureThumbnailUrl(wrapper);
+  }
+
+  function initAll() {
+    var wrappers = document.querySelectorAll(".vp-wrapper");
+    for (var i = 0; i < wrappers.length; i++) initWrapper(wrappers[i]);
+  }
+
+  // Event wiring from video-player.js
+  document.addEventListener("vp:init", function (e) {
+    var wrapper = e && e.detail && e.detail.wrapper;
+    if (wrapper) initWrapper(wrapper);
+  });
+
+  document.addEventListener("vp:play", function (e) {
+    var wrapper = e && e.detail && e.detail.wrapper;
+    if (!wrapper) return;
+    hideThumbnail(wrapper);
+  });
+
+  document.addEventListener("vp:ended", function (e) {
+    var wrapper = e && e.detail && e.detail.wrapper;
+    if (!wrapper) return;
+    // Only show after the video ends (not on pause).
+    showThumbnail(wrapper);
+  });
+
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", initAll);
+  } else {
+    initAll();
+  }
+
+  window.VideoPlayerThumbnailInit = initAll;
+})(window);
+
+
 (function (window) {
   "use strict";
 
@@ -90,6 +464,12 @@
     try {
       if (extra !== undefined) console.error("[VideoPlayer]", msg, describeEl(wrapper), wrapper, extra);
       else console.error("[VideoPlayer]", msg, describeEl(wrapper), wrapper);
+    } catch (e) {}
+  }
+
+  function emit(wrapper, name, detail) {
+    try {
+      document.dispatchEvent(new CustomEvent(name, { detail: detail || { wrapper: wrapper } }));
     } catch (e) {}
   }
 
@@ -200,6 +580,8 @@
     this.wrapper.setAttribute("tabindex", "0");
     this.wrapper.classList.remove("vp-started");
     this.wrapper.setAttribute("aria-label", this.title);
+
+    emit(this.wrapper, "vp:init", { wrapper: this.wrapper, player: this });
 
     this.buildCenterButton();
     if (this.showControls) this.buildControls();
@@ -474,6 +856,7 @@
               onStateChange: function (ev) {
                 // 1 playing, 2 paused, 0 ended
                 self.isPlaying = ev && ev.data === 1;
+                if (ev && ev.data === 0) emit(self.wrapper, "vp:ended", { wrapper: self.wrapper, player: self });
                 self.updateCenterButton();
                 self.updateControls();
               }
@@ -536,6 +919,12 @@
             self.updateCenterButton();
             self.updateControls();
           });
+          self.providerPlayer.on("ended", function () {
+            self.isPlaying = false;
+            self.updateCenterButton();
+            self.updateControls();
+            emit(self.wrapper, "vp:ended", { wrapper: self.wrapper, player: self });
+          });
           self.providerPlayer.on("timeupdate", function (data) {
             if (!data) return;
             if (typeof data.seconds === "number") self.currentTime = data.seconds;
@@ -581,6 +970,12 @@
       self.currentTime = video.currentTime || 0;
       self.updateControls();
     });
+    video.addEventListener("ended", function () {
+      self.isPlaying = false;
+      self.updateCenterButton();
+      self.updateControls();
+      emit(self.wrapper, "vp:ended", { wrapper: self.wrapper, player: self });
+    });
   };
 
   // Provider control helpers
@@ -620,6 +1015,8 @@
     this.updateCenterButton();
     this.updateControls();
     this.startTicking();
+
+    emit(this.wrapper, "vp:play", { wrapper: this.wrapper, player: this });
   };
 
   VideoPlayer.prototype.pause = function () {
