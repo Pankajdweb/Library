@@ -194,6 +194,9 @@
     var self = this;
 
     this.wrapper.classList.add("vp-min");
+    if (this.source.type === "youtube" || this.source.type === "vimeo") {
+      this.wrapper.classList.add("vp-embed-cover");
+    }
     this.wrapper.setAttribute("tabindex", "0");
     this.wrapper.classList.remove("vp-started");
     this.wrapper.setAttribute("aria-label", this.title);
@@ -439,7 +442,7 @@
       iframe.src = "https://www.youtube.com/embed/" + this.source.id + "?" + params;
       iframe.allow = "autoplay; encrypted-media; picture-in-picture";
       iframe.allowFullscreen = true;
-      iframe.style.cssText = "position:absolute;inset:0;width:100%;height:100%;border:none;";
+      iframe.style.cssText = "position:absolute;border:0;";
       this.container.insertBefore(iframe, this.container.firstChild);
       this.iframeEl = iframe;
 
@@ -496,7 +499,7 @@
       iframe2.src = "https://player.vimeo.com/video/" + this.source.id + "?" + params2;
       iframe2.allow = "autoplay; fullscreen; picture-in-picture";
       iframe2.allowFullscreen = true;
-      iframe2.style.cssText = "position:absolute;inset:0;width:100%;height:100%;border:none;";
+      iframe2.style.cssText = "position:absolute;border:0;";
       this.container.insertBefore(iframe2, this.container.firstChild);
       this.iframeEl = iframe2;
 
