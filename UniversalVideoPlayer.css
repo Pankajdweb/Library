@@ -31,6 +31,10 @@
   inset: 0;
 }
 
+[data-autoplay]{
+  pointer-events:none;
+}
+
 .vp-container video,
 .vp-container iframe {
   position: absolute;
